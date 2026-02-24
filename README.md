@@ -15,6 +15,7 @@ I use simple MLP Network with 2 layers:
 ### Technical
 - Cuda Programming and Advance C++.
 - Implement tiling matrix multiplication to take advantage of GPU ```__shared__``` memory, which reduces number of times communication between ```__global__``` memory and threads.
+- Adam Optimizer so the accuracy is around 98%.
 
 ### FUCK YOU
 Have a nice day~~ 
