@@ -8,6 +8,8 @@
 #include <random>
 #include <cassert>
 #include <algorithm>
+#include <numeric>
+#include <thread>
 #include <math.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -108,10 +110,12 @@ void read_labels_file(const std::string filename, std::vector<int> &labels) {
 		labels.push_back(static_cast<int>(label_data));
 }
 
-const std::string img_file = "t10k-images.idx3-ubyte";
-const std::string label_file = "t10k-labels.idx1-ubyte";
-std::vector<std::vector<uint8_t>> images;
-std::vector<int> labels;
+const std::string img_test = "t10k-images.idx3-ubyte";
+const std::string label_test = "t10k-labels.idx1-ubyte";
+const std::string img_file = "train-images.idx3-ubyte";
+const std::string label_file = "train-labels.idx1-ubyte";
+std::vector<std::vector<uint8_t>> images, images_test;
+std::vector<int> labels, labels_test;
 uint32_t num_images, num_rows, num_cols;
 
 
@@ -123,34 +127,31 @@ __global__ void vec_add(float* a, float* b, float* c, int size) {
 	}
 }
 
+
+//A[m, k] x B[k, n] = C[m, n]
 #define TILE_SIZE 16
 __global__ void matrix_mul(float* A, float* B, float* C, int M, int K, int N) {
-	int bx = blockIdx.x, by = blockIdx.y;
+	int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+	int col = blockIdx.x * TILE_SIZE + threadIdx.x;
 	int tx = threadIdx.x, ty = threadIdx.y;
-
-	int row = bx * TILE_SIZE + tx;
-	int col = by * TILE_SIZE + ty;
 
 	__shared__ float As[TILE_SIZE][TILE_SIZE];
 	__shared__ float Bs[TILE_SIZE][TILE_SIZE];
 
 	float sum = 0.0f;
-
 	for (int tile = 0; tile < (K + TILE_SIZE - 1) / TILE_SIZE; ++tile) {
-		if (row < M && tile * TILE_SIZE + ty < K)
-			As[tx][ty] = A[row * K + tile * TILE_SIZE + ty];
-		else
-			As[tx][ty] = 0.0f;
+		int k_A = tile * TILE_SIZE + tx;
+		if (row < M && k_A < K) As[ty][tx] = A[row * K + k_A];
+		else As[ty][tx] = 0.0f;
 
-		if (tile * TILE_SIZE + tx < K && col < N)
-			Bs[tx][ty] = B[(tile * TILE_SIZE + tx) * N + col];
-		else
-			Bs[tx][ty] = 0.0f;
+		int k_B = tile * TILE_SIZE + ty;
+		if (k_B < K && col < N) Bs[ty][tx] = B[k_B * N + col];
+		else Bs[ty][tx] = 0.0f;
 
 		__syncthreads();
 
 		for (int k = 0; k < TILE_SIZE; ++k)
-			sum += As[tx][k] * Bs[k][ty];
+			sum += As[ty][k] * Bs[k][tx];
 
 		__syncthreads();
 	}
@@ -160,9 +161,70 @@ __global__ void matrix_mul(float* A, float* B, float* C, int M, int K, int N) {
 	}
 }
 
+// A[m, k] x B[n, k]^T = C[m, n]
+__global__ void matrix_mul_transB(float* A, float* B, float* C, int M, int K, int N) {
+	int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+	int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+	int tx = threadIdx.x, ty = threadIdx.y;
+
+	__shared__ float As[TILE_SIZE][TILE_SIZE];
+	__shared__ float Bs[TILE_SIZE][TILE_SIZE];
+
+	float sum = 0.0f;
+	for (int tile = 0; tile < (K + TILE_SIZE - 1) / TILE_SIZE; ++tile) {
+		int k_A = tile * TILE_SIZE + tx;
+		if (row < M && k_A < K) As[ty][tx] = A[row * K + k_A];
+		else As[ty][tx] = 0.0f;
+
+		int k_B = tile * TILE_SIZE + ty;
+		if (col < N && k_B < K) Bs[ty][tx] = B[col * K + k_B]; // B[col, k_B]
+		else Bs[ty][tx] = 0.0f;
+
+		__syncthreads();
+
+		for (int k = 0; k < TILE_SIZE; ++k)
+			sum += As[ty][k] * Bs[k][tx];
+
+		__syncthreads();
+	}
+
+	if (row < M && col < N)
+		C[row * N + col] = sum;
+}
+
+// A[k, m]^T x B[k, n] = C[m, n]
+__global__ void matrix_mul_transA(float* A, float* B, float* C, int M, int K, int N) {
+	int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+	int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+	int tx = threadIdx.x, ty = threadIdx.y;
+
+	__shared__ float As[TILE_SIZE][TILE_SIZE];
+	__shared__ float Bs[TILE_SIZE][TILE_SIZE];
+
+	float sum = 0.0f;
+	for (int tile = 0; tile < (K + TILE_SIZE - 1) / TILE_SIZE; ++tile) {
+		int k_A = tile * TILE_SIZE + tx;
+		if (k_A < K && row < M) As[ty][tx] = A[k_A * M + row]; // A[k_A, row]
+		else As[ty][tx] = 0.0f;
+
+		int k_B = tile * TILE_SIZE + ty;
+		if (k_B < K && col < N) Bs[ty][tx] = B[k_B * N + col];
+		else Bs[ty][tx] = 0.0f;
+
+		__syncthreads();
+
+		for (int k = 0; k < TILE_SIZE; ++k)
+			sum += As[ty][k] * Bs[k][tx];
+
+		__syncthreads();
+	}
+
+	if (row < M && col < N)
+		C[row * N + col] = sum;
+}
+
 __global__ void bias_addition(float* x, float* b, int size_x, int size_b) {
 	int idx = blockDim.x * blockIdx.x + threadIdx.x;
-
 	if (idx < size_x) {
 		x[idx] += b[idx % size_b];
 	}
@@ -170,7 +232,6 @@ __global__ void bias_addition(float* x, float* b, int size_x, int size_b) {
 
 __global__ void ReLU(float* x, int size) {
 	int idx = blockDim.x * blockIdx.x + threadIdx.x;
-
 	if (idx < size) {
 		x[idx] = fmaxf(0.0f, x[idx]);
 	}
@@ -178,15 +239,12 @@ __global__ void ReLU(float* x, int size) {
 
 __global__ void softmax(float* x, int batch_size, int size) {
 	int idx = blockDim.x * blockIdx.x + threadIdx.x;
-
 	if (idx < batch_size) {
 		float max_val = x[idx * size];
-
 		for (int i = 1; i < size; ++i)
 			max_val = fmaxf(max_val, x[idx * size + i]);
 
 		float sum = 0.0f;
-
 		for (int i = 0; i < size; ++i) {
 			x[idx * size + i] = expf(x[idx * size + i] - max_val);
 			sum += x[idx * size + i];
@@ -200,40 +258,52 @@ __global__ void softmax(float* x, int batch_size, int size) {
 
 __global__ void zero_grad(float* grad, int size) {
 	int idx = blockDim.x * blockIdx.x + threadIdx.x;
-
 	if (idx < size) {
 		grad[idx] = 0.0f;
 	}
 }
 
-__global__ void ReLU_backward(float* grad, float *x, int size) {
-	int idx = blockDim.x * blockIdx.x + threadIdx.x;
-
-	if (idx < size) {
-		grad[idx] *= (x[idx] > 0);
-	}
-}
-
-__global__ void softmax_backward(float* grad, float* x, int batch_size, int input_size, int output_size) {
-	int row = blockDim.x * blockIdx.x + threadIdx.x;
-	int col = blockDim.y * blockIdx.y + threadIdx.x;
+/*
+	Backpropagation:
+	z(i, l) = a(i, l - 1) * w(j, l) + b(l)
+	dL/dw(i, j, l) = dL/dz(i, l) * dz(i, l)/dw(i, j, l) = dL/dz(i, l) * a(i, l - 1)
 	
-	if (row < input_size && col < output_size) {
-		
+	a(i, l + 1) = f(z(i, l)) (f = activation function)
+
+	dL/dz(i, l) = dL/da(i, l + 1) * da(i, l + 1)/dz(i, l) = dL/da(i, l + 1) * f'(z(i, l))
+	
+	dL/da(i, l + 1) = sum(dL/dz(k, l + 1) * dz(k, l + 1)/da(i, l + 1)) = sum(dL/dz(k, + 1) * w(i, k, l + 1))
+*/
+
+__global__ void ReLU_backward(float* dZ1, float* x, int size) {
+	int idx = blockDim.x * blockIdx.x + threadIdx.x;
+	if (idx < size) {
+		dZ1[idx] = (x[idx] > 0.0f) ? dZ1[idx] : 0.0f;
 	}
 }
 
-float CrossEntropyLoss(float* a) {
-	if (a == NULL) {
-		std::cout << "Null pointer detected";
-		exit(EXIT_FAILURE);
+__global__ void softmax_cross_entropy_backward(float* dZ2, float* probs, int* labels, int batch_size, int num_classes) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < batch_size * num_classes) {
+		int b = idx / num_classes;
+		int c = idx % num_classes;
+		dZ2[idx] = (probs[idx] - (c == labels[b] ? 1.0f : 0.0f)) / batch_size;
 	}
+}
 
-	float ans = 0.0f;
-	for (int i = 0; i < 10; ++i)
-		ans += -std::log(a[i] + 1e-7f);
+__global__ void bias_backward(float* db, float* dZ, int batch_size, int size) {
+	int idx = blockDim.x * blockIdx.x + threadIdx.x;
+	if (idx < size) {
+		for (int i = 0; i < batch_size; ++i)
+			db[idx] += dZ[i * size + idx];
+	}
+}
 
-	return ans;
+__global__ void update_weights(float* weights, float* dW, float lr, int size) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < size) {
+		weights[idx] -= lr * dW[idx];
+	}
 }
 
 const unsigned int batch_size = 64;
@@ -264,48 +334,13 @@ public:
 		std::fill(b, b + size, 0.0f);
 	}
 
-	float* forward(float* x, int batch_size) {
-		dim3 blockDim(TILE_SIZE, TILE_SIZE);
-
-		cudaMallocManaged(&this->cache_out1, batch_size * this->w1_cols * sizeof(float));
-
-		matrix_mul<<<dim3((batch_size + TILE_SIZE - 1) / TILE_SIZE, (this->w1_cols + TILE_SIZE - 1) / TILE_SIZE), blockDim>>>(x, this->weights1, this->cache_out1, batch_size, this->w1_rows, this->w1_cols);
-		cudaDeviceSynchronize();
-
-		bias_addition<<<(batch_size * this->bias1_size + 255) / 256, 256>>>(this->cache_out1, this->bias1, batch_size * this->bias1_size, this->bias1_size);
-		cudaDeviceSynchronize();
-
-		ReLU<<<(batch_size * this->bias1_size + 255) / 256, 256>>>(this->cache_out1, batch_size * this->bias1_size);
-		cudaDeviceSynchronize();
-
-		cudaMallocManaged(&this->cache_out2, batch_size * this->w2_cols * sizeof(float));
-
-		matrix_mul<<<dim3((batch_size + TILE_SIZE - 1) / TILE_SIZE, (this->w2_cols + TILE_SIZE - 1) / TILE_SIZE), blockDim>>> (this->cache_out1, this->weights2, this->cache_out2, batch_size, this->w2_rows, this->w2_cols);
-		cudaDeviceSynchronize();
-
-		bias_addition<<<(batch_size * this->bias2_size + 255) / 256, 256>>>(this->cache_out2, this->bias2, batch_size * this->bias2_size, this->bias2_size);
-		cudaDeviceSynchronize();
-
-		softmax<<<(batch_size + 255) / 256, 256>>>(this->cache_out2, batch_size, this->bias2_size);
-		cudaDeviceSynchronize();
-
-		
-		return this->cache_out2;
-	}
-
-	void backward(float* output, float* x) {
-		
-	}
-
-	void set_zero_grad() {
-		zero_grad<<<(this->w1_rows * this->w1_cols + 255) / 256, 256>>>(this->grad_weights1, this->w1_rows * this->w1_cols);
-		zero_grad<<<(this->w2_rows * this->w2_cols + 255) / 256, 256>>>(this->grad_weights2, this->w2_rows * this->w2_cols);
-		zero_grad<<<(this->bias1_size + 255) / 256, 256>>> (this->grad_bias1, this->bias1_size);
-		zero_grad<<<(this->bias2_size + 255) / 256, 256>>> (this->grad_bias2, this->bias2_size);
-	}
-
 	NeuralNetwork(int input_size1, int input_size2, int output_size) {
-		this->learning_rate = 0.01f;
+		this->learning_rate = 0.02f;
+
+		this->w1_rows = input_size1;
+		this->w1_cols = this->bias1_size = this->w2_rows = input_size2;
+		this->w2_cols = this->bias2_size = output_size;
+
 		initializeMatrix(this->weights1, input_size1, input_size2);
 		initializeBias(this->bias1, input_size2);
 		initializeMatrix(this->weights2, input_size2, output_size);
@@ -316,22 +351,92 @@ public:
 		cudaMallocManaged(&this->grad_bias1, input_size2 * sizeof(float));
 		cudaMallocManaged(&this->grad_bias2, output_size * sizeof(float));
 
-		this->w1_rows = input_size1;
-		this->w1_cols = this->bias1_size = this->w2_rows = input_size2;
-		this->w2_cols = this->bias2_size = output_size;
+		cudaMallocManaged(&this->cache_out1, batch_size * this->w1_cols * sizeof(float));
+		cudaMallocManaged(&this->cache_out2, batch_size * this->w2_cols * sizeof(float));
+		cudaMallocManaged(&this->dZ1, batch_size * this->w1_cols * sizeof(float));
+		cudaMallocManaged(&this->dZ2, batch_size * this->w2_cols * sizeof(float));
 	}
 
 	~NeuralNetwork() {
-		cudaFree(weights1);
-		cudaFree(weights2);
-		cudaFree(bias1);
-		cudaFree(bias2);
-		cudaFree(grad_weights1);
-		cudaFree(grad_weights2);
-		cudaFree(grad_bias1);
-		cudaFree(grad_bias2);
-		cudaFree(cache_out1);
-		cudaFree(cache_out2);
+		cudaFree(weights1);  cudaFree(weights2);
+		cudaFree(bias1);     cudaFree(bias2);
+		cudaFree(grad_weights1); cudaFree(grad_weights2);
+		cudaFree(grad_bias1);    cudaFree(grad_bias2);
+		cudaFree(cache_out1);    cudaFree(cache_out2);
+		cudaFree(dZ1);           cudaFree(dZ2);
+	}
+
+	float* forward(float* x, int current_batch_size) {
+		dim3 blockDim(TILE_SIZE, TILE_SIZE);
+
+		dim3 grid1((this->w1_cols + TILE_SIZE - 1) / TILE_SIZE, (current_batch_size + TILE_SIZE - 1) / TILE_SIZE);
+		matrix_mul << <grid1, blockDim >> > (x, this->weights1, this->cache_out1, current_batch_size, this->w1_rows, this->w1_cols);
+		cudaDeviceSynchronize();
+
+		bias_addition << <(current_batch_size * this->bias1_size + 255) / 256, 256 >> > (this->cache_out1, this->bias1, current_batch_size * this->bias1_size, this->bias1_size);
+		cudaDeviceSynchronize();
+
+		ReLU << <(current_batch_size * this->bias1_size + 255) / 256, 256 >> > (this->cache_out1, current_batch_size * this->bias1_size);
+		cudaDeviceSynchronize();
+
+		dim3 grid2((this->w2_cols + TILE_SIZE - 1) / TILE_SIZE, (current_batch_size + TILE_SIZE - 1) / TILE_SIZE);
+		matrix_mul << <grid2, blockDim >> > (this->cache_out1, this->weights2, this->cache_out2, current_batch_size, this->w2_rows, this->w2_cols);
+		cudaDeviceSynchronize();
+
+		bias_addition << <(current_batch_size * this->bias2_size + 255) / 256, 256 >> > (this->cache_out2, this->bias2, current_batch_size * this->bias2_size, this->bias2_size);
+		cudaDeviceSynchronize();
+
+		softmax << <(current_batch_size + 255) / 256, 256 >> > (this->cache_out2, current_batch_size, this->bias2_size);
+		cudaDeviceSynchronize();
+
+		return this->cache_out2;
+	}
+
+	void backward(float* x, int* labels, int current_batch_size) {
+		dim3 blockDim(TILE_SIZE, TILE_SIZE);
+
+		// 1. Compute dZ2
+		softmax_cross_entropy_backward << <(current_batch_size * this->w2_cols + 255) / 256, 256 >> > (this->dZ2, this->cache_out2, labels, current_batch_size, this->w2_cols);
+		cudaDeviceSynchronize();
+
+		// 2. Compute dW2 = A1^T x dZ2
+		dim3 grid_dW2((this->w2_cols + TILE_SIZE - 1) / TILE_SIZE, (this->w2_rows + TILE_SIZE - 1) / TILE_SIZE);
+		matrix_mul_transA << <grid_dW2, blockDim >> > (this->cache_out1, this->dZ2, this->grad_weights2, this->w2_rows, current_batch_size, this->w2_cols);
+
+		// 3. Compute db2
+		bias_backward << <(this->bias2_size + 255) / 256, 256 >> > (this->grad_bias2, this->dZ2, current_batch_size, this->bias2_size);
+
+		// 4. Compute dZ1 = dZ2 x W2^T
+		dim3 grid_dZ1((this->w1_cols + TILE_SIZE - 1) / TILE_SIZE, (current_batch_size + TILE_SIZE - 1) / TILE_SIZE);
+		matrix_mul_transB << <grid_dZ1, blockDim >> > (this->dZ2, this->weights2, this->dZ1, current_batch_size, this->w2_cols, this->w1_cols);
+		cudaDeviceSynchronize();
+
+		// 5. Backprop through
+		ReLU_backward << <(current_batch_size * this->w1_cols + 255) / 256, 256 >> > (this->dZ1, this->cache_out1, current_batch_size * this->w1_cols);
+		cudaDeviceSynchronize();
+
+		// 6. Compute dW1 = X^T x dZ1
+		dim3 grid_dW1((this->w1_cols + TILE_SIZE - 1) / TILE_SIZE, (this->w1_rows + TILE_SIZE - 1) / TILE_SIZE);
+		matrix_mul_transA << <grid_dW1, blockDim >> > (x, this->dZ1, this->grad_weights1, this->w1_rows, current_batch_size, this->w1_cols);
+		cudaDeviceSynchronize();
+
+		// 7. Compute db1
+		bias_backward << <(this->w1_cols + 255) / 256, 256 >> > (this->grad_bias1, this->dZ1, current_batch_size, this->w1_cols);
+		cudaDeviceSynchronize();
+
+		// 8. Update Weights and Biases
+		update_weights << <(this->w1_rows * this->w1_cols + 255) / 256, 256 >> > (this->weights1, this->grad_weights1, this->learning_rate, this->w1_rows * this->w1_cols);
+		update_weights << <(this->bias1_size + 255) / 256, 256 >> > (this->bias1, this->grad_bias1, this->learning_rate, this->bias1_size);
+		update_weights << <(this->w2_rows * this->w2_cols + 255) / 256, 256 >> > (this->weights2, this->grad_weights2, this->learning_rate, this->w2_rows * this->w2_cols);
+		update_weights << <(this->bias2_size + 255) / 256, 256 >> > (this->bias2, this->grad_bias2, this->learning_rate, this->bias2_size);
+		cudaDeviceSynchronize();
+	}
+
+	void set_zero_grad() {
+		zero_grad << <(this->w1_rows * this->w1_cols + 255) / 256, 256 >> > (this->grad_weights1, this->w1_rows * this->w1_cols);
+		zero_grad << <(this->w2_rows * this->w2_cols + 255) / 256, 256 >> > (this->grad_weights2, this->w2_rows * this->w2_cols);
+		zero_grad << <(this->bias1_size + 255) / 256, 256 >> > (this->grad_bias1, this->bias1_size);
+		zero_grad << <(this->bias2_size + 255) / 256, 256 >> > (this->grad_bias2, this->bias2_size);
 	}
 
 private:
@@ -346,6 +451,8 @@ private:
 	float* grad_weights2;
 	float* grad_bias1;
 	float* grad_bias2;
+	float* dZ1;
+	float* dZ2;
 	size_t w1_rows;
 	size_t w1_cols;
 	size_t bias1_size;
@@ -354,16 +461,116 @@ private:
 	size_t bias2_size;
 };
 
+
+double compute_cross_entropy_loss(float* probs, int* labels, int current_batch_size, int num_classes) {
+	double batch_loss = 0.0;
+
+	for (int i = 0; i < current_batch_size; ++i) {
+		int true_class = labels[i];
+
+		float p = probs[i * num_classes + true_class];
+
+		p = fmaxf(p, 1e-7f);
+
+		batch_loss -= logf(p);
+	}
+
+	return batch_loss;
+}
+
 void Training(NeuralNetwork& Net) {
-	int num_epochs = 50;
+	int num_epochs = 30;
+	int num_classes = 10;
+	int input_size = num_rows * num_cols;
+
+	std::vector<int> index(num_images);
+	std::iota(index.begin(), index.end(), 0);
+	std::mt19937 rng(42);
+
+	float* d_data;
+	int* d_labels;
+	cudaMallocManaged(&d_data, batch_size * input_size * sizeof(float));
+	cudaMallocManaged(&d_labels, batch_size * sizeof(int));
 
 	for (int epoch = 0; epoch < num_epochs; ++epoch) {
-		Net.set_zero_grad();
+		std::shuffle(index.begin(), index.end(), rng);
+
+		double total_loss = 0.0;
+		int num_batches = 0;
+
+		for (int i = 0; i < num_images; i += batch_size) {
+			int current_batch_size = std::min(batch_size, num_images - i);
+
+			for (int j = 0; j < current_batch_size; ++j) {
+				int original_idx = index[i + j];
+
+				for (size_t k = 0; k < input_size; ++k) {
+					d_data[j * input_size + k] = float(images[original_idx][k]) / 255.0f;
+				}
+				d_labels[j] = labels[original_idx];
+			}
+
+			Net.set_zero_grad();
+
+			float* probs = Net.forward(d_data, current_batch_size);
+
+			cudaDeviceSynchronize();
+
+			double batch_loss = compute_cross_entropy_loss(probs, d_labels, current_batch_size, num_classes);
+			total_loss += batch_loss;
+
+			Net.backward(d_data, d_labels, current_batch_size);
+
+			num_batches++;
+
+			if (num_batches % 50 == 0) {
+				std::cout << "\rTraining Epoch " << epoch + 1 << "/" << num_epochs
+					<< " | Progress: " << float(i + current_batch_size) / num_images * 100.0f << "%"
+					<< std::flush;
+			}
+		}
+
+		double avg_loss = total_loss / num_images;
+
+		std::cout << "\rEpoch " << epoch + 1 << "/" << num_epochs
+			<< " Completed | Average Loss: " << avg_loss << "                     \n";
 	}
+
+	cudaFree(d_data);
+	cudaFree(d_labels);
 }
 
 void Evaluating(NeuralNetwork& Net) {
+	int input_size = num_rows * num_cols;
 
+	float* d_data;
+	int* d_labels;
+	cudaMallocManaged(&d_data, input_size * sizeof(float));
+	cudaMallocManaged(&d_labels, sizeof(int));
+
+	int acc = 0;
+	for (int i = 0; i < num_images; ++i) {
+		for (size_t k = 0; k < input_size; ++k) {
+			d_data[k] = float(images_test[i][k]) / 255.0f;
+		}
+		d_labels[0] = labels_test[i];
+
+		float* predict = Net.forward(d_data, 1);
+		cudaDeviceSynchronize();
+
+		int label = 0;
+		for (int i = 1; i < 10; ++i)
+			if (predict[i] > predict[label])
+				label = i;
+
+		acc += (label == d_labels[0]);
+
+		std::cout << "\rEvaluating "
+			<< " | Progress: " << float(i) / num_images * 100.0f << "%\n"
+			<< std::flush;
+	}
+
+	std::cout << "Accuracy: " << float(acc) / num_images * 100.0f << "%";
 }
 
 
@@ -379,6 +586,10 @@ int main(int argc, char* argv[]) {
 	NeuralNetwork Net(784, 1024, 10);
 
 	Training(Net);
+
+	std::tie(num_images, num_rows, num_cols) = read_mnist_images(img_test, images_test);
+	read_labels_file(label_test, labels_test);
+
 	Evaluating(Net);
 
 }
