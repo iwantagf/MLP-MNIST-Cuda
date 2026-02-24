@@ -625,7 +625,7 @@ void Evaluating(NeuralNetwork& Net) {
 
 	}
 
-	std::cout << "\rAccuracy: " << float(acc) / num_images << std::flush;
+	std::cout << "\r\r\r\rAccuracy: " << float(acc) / num_images * 100.0f << std::flush;
 	cudaFree(d_data);
 	cudaFree(d_labels);
 }
