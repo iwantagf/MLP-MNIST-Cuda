@@ -54,6 +54,8 @@ std::tuple<uint32_t, uint32_t, uint32_t>  read_mnist_images(const std::string& f
 		exit(EXIT_FAILURE);
 	}
 
+	images.clear();
+
 	uint32_t magic_number = 0;
 	uint32_t num_images = 0;
 	uint32_t num_rows = 0;
@@ -92,6 +94,8 @@ void read_labels_file(const std::string filename, std::vector<int> &labels) {
 		std::cout << "Caught Error when open file" << std::endl;
 		exit(EXIT_FAILURE);
 	}
+
+	labels.clear();
 
 	uint32_t magic_number = 0;
 	uint32_t num_labels = 0;
