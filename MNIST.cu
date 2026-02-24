@@ -299,10 +299,17 @@ __global__ void bias_backward(float* db, float* dZ, int batch_size, int size) {
 	}
 }
 
-__global__ void update_weights(float* weights, float* dW, float lr, int size) {
+__global__ void adam_update(float* W, float* dW, float* m, float* v, float lr, float beta1, float beta2, float epsilon, int t, int size) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (idx < size) {
-		weights[idx] -= lr * dW[idx];
+		float grad = dW[idx];
+		m[idx] = beta1 * m[idx] + (1.0f - beta1) * grad;
+		v[idx] = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
+
+		float m_hat = m[idx] / (1.0f - powf(beta1, t));
+		float v_hat = v[idx] / (1.0f - powf(beta2, t));
+
+		W[idx] -= lr * m_hat / (sqrtf(v_hat) + epsilon);
 	}
 }
 
@@ -335,7 +342,29 @@ public:
 	}
 
 	NeuralNetwork(int input_size1, int input_size2, int output_size) {
-		this->learning_rate = 0.02f;
+		this->t = 1;
+		this->learning_rate = 0.001f;
+		this->beta1 = 0.9f;
+		this->beta2 = 0.999f;
+		this->epsilon = 1e-8f;
+
+		cudaMallocManaged(&this->m_w1, input_size1 * input_size2 * sizeof(float));
+		cudaMallocManaged(&this->v_w1, input_size1 * input_size2 * sizeof(float));
+		cudaMallocManaged(&this->m_b1, input_size2 * sizeof(float));
+		cudaMallocManaged(&this->v_b1, input_size2 * sizeof(float));
+		cudaMallocManaged(&this->m_w2, input_size2 * output_size * sizeof(float));
+		cudaMallocManaged(&this->v_w2, input_size2 * output_size * sizeof(float));
+		cudaMallocManaged(&this->m_b2, output_size * sizeof(float));
+		cudaMallocManaged(&this->v_b2, output_size * sizeof(float));
+
+		cudaMemset(this->m_w1, 0, input_size1 * input_size2 * sizeof(float));
+		cudaMemset(this->v_w1, 0, input_size1 * input_size2 * sizeof(float));
+		cudaMemset(this->m_b1, 0, input_size2 * sizeof(float));
+		cudaMemset(this->v_b1, 0, input_size2 * sizeof(float));
+		cudaMemset(this->m_w2, 0, input_size2 * output_size * sizeof(float));
+		cudaMemset(this->v_w2, 0, input_size2 * output_size * sizeof(float));
+		cudaMemset(this->m_b2, 0, output_size * sizeof(float));
+		cudaMemset(this->v_b2, 0, output_size * sizeof(float));
 
 		this->w1_rows = input_size1;
 		this->w1_cols = this->bias1_size = this->w2_rows = input_size2;
@@ -425,11 +454,13 @@ public:
 		cudaDeviceSynchronize();
 
 		// 8. Update Weights and Biases
-		update_weights << <(this->w1_rows * this->w1_cols + 255) / 256, 256 >> > (this->weights1, this->grad_weights1, this->learning_rate, this->w1_rows * this->w1_cols);
-		update_weights << <(this->bias1_size + 255) / 256, 256 >> > (this->bias1, this->grad_bias1, this->learning_rate, this->bias1_size);
-		update_weights << <(this->w2_rows * this->w2_cols + 255) / 256, 256 >> > (this->weights2, this->grad_weights2, this->learning_rate, this->w2_rows * this->w2_cols);
-		update_weights << <(this->bias2_size + 255) / 256, 256 >> > (this->bias2, this->grad_bias2, this->learning_rate, this->bias2_size);
+		adam_update<<<(this->w1_rows * this->w1_cols + 255) / 256, 256>>> (this->weights1, this->grad_weights1, this->m_w1, this->v_w1, this->learning_rate, this->beta1, this->beta2, this->epsilon, this->t, this->w1_rows * this->w1_cols);
+		adam_update<<<(this->bias1_size + 255) / 256, 256>>> (this->bias1, this->grad_bias1, this->m_b1, this->v_b1, this->learning_rate, this->beta1, this->beta2, this->epsilon, this->t, this->bias1_size);
+		adam_update<<<(this->w2_rows * this->w2_cols + 255) / 256, 256>>> (this->weights2, this->grad_weights2, this->m_w2, this->v_w2, this->learning_rate, this->beta1, this->beta2, this->epsilon, this->t, this->w2_rows * this->w2_cols);
+		adam_update<<<(this->bias2_size + 255) / 256, 256>>> (this->bias2, this->grad_bias2, this->m_b2, this->v_b2, this->learning_rate, this->beta1, this->beta2, this->epsilon, this->t, this->bias2_size);
 		cudaDeviceSynchronize();
+
+		this->t += 1;
 	}
 
 	void set_zero_grad() {
@@ -440,6 +471,21 @@ public:
 	}
 
 private:
+	int t;
+	float beta1;
+	float beta2;
+	float epsilon;
+
+	float* m_w1;
+	float* v_w1;
+	float* m_b1;
+	float* v_b1;
+	float* m_w2;
+	float* v_w2;
+	float* m_b2;
+	float* v_b2;
+
+
 	float learning_rate;
 	float* weights1;
 	float* weights2;
@@ -545,32 +591,43 @@ void Evaluating(NeuralNetwork& Net) {
 
 	float* d_data;
 	int* d_labels;
-	cudaMallocManaged(&d_data, input_size * sizeof(float));
-	cudaMallocManaged(&d_labels, sizeof(int));
+	cudaMallocManaged(&d_data, batch_size * input_size * sizeof(float));
+	cudaMallocManaged(&d_labels, batch_size * sizeof(int));
+
 
 	int acc = 0;
-	for (int i = 0; i < num_images; ++i) {
-		for (size_t k = 0; k < input_size; ++k) {
-			d_data[k] = float(images_test[i][k]) / 255.0f;
-		}
-		d_labels[0] = labels_test[i];
+	for (int i = 0; i < num_images; i += batch_size) {
+		int current_batch_size = std::min(batch_size, num_images - i);
 
-		float* predict = Net.forward(d_data, 1);
+		for (int j = 0; j < current_batch_size; ++j) {
+			for (size_t k = 0; k < input_size; ++k) {
+				d_data[j * input_size + k] = float(images[i + j][k]) / 255.0f;
+			}
+			d_labels[j] = labels[i + j];
+		}
+
+		float* probs = Net.forward(d_data, current_batch_size);
+
 		cudaDeviceSynchronize();
 
-		int label = 0;
-		for (int i = 1; i < 10; ++i)
-			if (predict[i] > predict[label])
-				label = i;
+		for (int j = 0; j < current_batch_size; ++j) {
+			int label = 0;
+			for (size_t k = 1; k < 10; ++k)
+				if (probs[j * 10 + k] > probs[j * 10 + label])
+					label = k;
 
-		acc += (label == d_labels[0]);
+			acc += (label == d_labels[j]);
+		}
 
-		std::cout << "\rEvaluating "
-			<< " | Progress: " << float(i) / num_images * 100.0f << "%\n"
-			<< std::flush;
+		std::cout << "\rEvaluating"
+		<< " | Progress: " << float(i + current_batch_size) / num_images * 100.0f << "%"
+		<< std::flush;
+
 	}
 
-	std::cout << "Accuracy: " << float(acc) / num_images * 100.0f << "%";
+	std::cout << "\rAccuracy: " << float(acc) / num_images << std::flush;
+	cudaFree(d_data);
+	cudaFree(d_labels);
 }
 
 
