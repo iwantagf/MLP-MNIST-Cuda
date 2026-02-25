@@ -575,7 +575,7 @@ void Training(NeuralNetwork& Net) {
 
 			if (num_batches % 50 == 0) {
 				std::cout << "\rTraining Epoch " << epoch + 1 << "/" << num_epochs
-					<< " | Progress: " << float(i + current_batch_size) / num_images * 100.0f << "%"
+					<< " | Progress: " << (int) (float(i + current_batch_size) / num_images * 100) << "%"
 					<< std::flush;
 			}
 		}
@@ -624,12 +624,11 @@ void Evaluating(NeuralNetwork& Net) {
 		}
 
 		std::cout << "\rEvaluating"
-		<< " | Progress: " << float(i + current_batch_size) / num_images * 100.0f << "%"
+		<< " | Progress: " << (int) (float(i + current_batch_size) / num_images * 100) << "%"
 		<< std::flush;
 
 	}
-
-	std::cout << "\r\r\r\rAccuracy: " << float(acc) / num_images * 100.0f << std::flush;
+	std::cout << "\n\n\nAccuracy: " << float(acc) / num_images * 100.0f << "%" << std::flush;
 	cudaFree(d_data);
 	cudaFree(d_labels);
 }
